@@ -2,15 +2,50 @@ import os
 import re
 import unicodedata
 import zipfile
+import io
+import uuid
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from docx import Document
 
 app = FastAPI(title="Validador de Transcripciones")
+
+# ==========================
+# CORS: habilitar solo tus dominios
+# ==========================
+ALLOWED_ORIGINS = [
+    "https://www.dipli.ai",
+    "https://dipli.ai",
+    "https://isagarcivill09.wixsite.com/turop",
+    "https://isagarcivill09.wixsite.com/turop/tienda",
+    "https://isagarcivill09-wixsite-com.filesusr.com"
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ==========================
+# Almacenamiento temporal de descargas
+# ==========================
+DOWNLOADS = {}
+EXP_MINUTES = 5  # tiempo de expiración del link
+
+def cleanup_downloads():
+    """Eliminar tokens expirados"""
+    now = datetime.utcnow()
+    expired = [t for t, (_, exp) in DOWNLOADS.items() if exp <= now]
+    for t in expired:
+        DOWNLOADS.pop(t, None)
 
 # ==========================
 # Validaciones
@@ -129,15 +164,29 @@ async def procesar(file: UploadFile = File(...)):
 
     docx_bytes, txt_bytes = validar_y_limpiar(doc, file.filename)
 
-    # Crear ZIP
-    zip_buffer = BytesIO()
+    # Crear ZIP en memoria
+    zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w") as zipf:
         zipf.writestr(file.filename.replace(".docx", "_limpio.docx"), docx_bytes.read())
         zipf.writestr(file.filename.replace(".docx", "_errores.txt"), txt_bytes.read())
     zip_buffer.seek(0)
 
-    return StreamingResponse(
-        zip_buffer,
-        media_type="application/zip",
-        headers={"Content-Disposition": f"attachment; filename=resultado_{file.filename}.zip"}
-    )
+    # Crear token único
+    token = str(uuid.uuid4())
+    DOWNLOADS[token] = (zip_buffer.getvalue(), datetime.utcnow() + timedelta(minutes=EXP_MINUTES))
+
+    return JSONResponse({"token": token, "expires_in": EXP_MINUTES})
+
+
+@app.get("/download/{token}")
+def download_token(token: str):
+    cleanup_downloads()
+    item = DOWNLOADS.get(token)
+    if not item:
+        raise HTTPException(status_code=404, detail="Link expirado o inválido")
+    data, exp = item
+    if exp <= datetime.utcnow():
+        DOWNLOADS.pop(token, None)
+        raise HTTPException(status_code=410, detail="Link expirado")
+    headers = {"Content-Disposition": "attachment; filename=reportes_transcripciones.zip"}
+    return StreamingResponse(io.BytesIO(data), media_type="application/zip", headers=headers)
