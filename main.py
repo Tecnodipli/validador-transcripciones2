@@ -6,17 +6,20 @@ import io
 import uuid
 from collections import Counter
 from datetime import datetime, timedelta
-from io import BytesIO
+from typing import List
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from docx import Document
 
+# ==========================
+# Inicialización de FastAPI
+# ==========================
 app = FastAPI(title="Validador de Transcripciones")
 
 # ==========================
-# CORS: habilitar solo tus dominios
+# CORS: habilitar solo dominios permitidos
 # ==========================
 ALLOWED_ORIGINS = [
     "https://www.dipli.ai",
@@ -35,10 +38,10 @@ app.add_middleware(
 )
 
 # ==========================
-# Almacenamiento temporal de descargas
+# Descargas temporales
 # ==========================
 DOWNLOADS = {}
-EXP_MINUTES = 5  # tiempo de expiración del link
+EXP_MINUTES = 5  # tiempo de expiración del link en minutos
 
 def cleanup_downloads():
     """Eliminar tokens expirados"""
@@ -77,22 +80,22 @@ def validar_y_limpiar(doc: Document, filename: str):
 
         # Validaciones etiquetas
         if "speaker" in texto_norm:
-            errores.append((i+1, "Etiqueta inválida", f"Se encontró '{texto}'. Usa 'ENTREVISTADOR:' o 'ENTREVISTADO:'."))
+            errores.append((i+1, "Etiqueta inválida", f"'{texto}' → usa ENTREVISTADOR/ENTREVISTADO"))
 
         if "usuario" in texto_norm:
-            errores.append((i+1, "Etiqueta inválida", f"Se encontró 'Usuario'. Usa 'ENTREVISTADO:' o 'ENTREVISTADOR:'."))
+            errores.append((i+1, "Etiqueta inválida", f"Se encontró 'Usuario'. Usa ENTREVISTADO: o ENTREVISTADOR:"))
 
         if "xxx" in texto_norm:
-            errores.append((i+1, "Etiqueta inválida", f"Se encontró '{texto}'. Reemplázalo por la etiqueta correcta."))
+            errores.append((i+1, "Etiqueta inválida", f"'{texto}' → reemplázalo por la etiqueta correcta."))
 
         match = re.match(r"^([A-ZÁÉÍÓÚÑ]+:)", texto)
         if match:
             etiqueta = match.group(1)
             if etiqueta not in ETIQUETAS_VALIDAS:
-                errores.append((i+1, "Etiqueta inválida", f"Se encontró '{etiqueta}'. Usa solo {ETIQUETAS_VALIDAS}"))
+                errores.append((i+1, "Etiqueta inválida", f"Se encontró '{etiqueta}'"))
             else:
                 if texto == etiqueta:
-                    errores.append((i+1, "Formato incorrecto", f"La etiqueta '{etiqueta}' está sola. Debe ir junto con el texto."))
+                    errores.append((i+1, "Formato incorrecto", f"La etiqueta '{etiqueta}' está sola."))
 
                 if etiqueta in ["ENTREVISTADOR:", "ENTREVISTADORA:"]:
                     encabezado_ok = any(run.text.strip().startswith(etiqueta) and run.bold for run in para.runs)
@@ -108,13 +111,13 @@ def validar_y_limpiar(doc: Document, filename: str):
             fuente = run.font.name
             tamano = run.font.size.pt if run.font.size else None
             if fuente and fuente.lower() != "arial":
-                errores.append((i+1, "Fuente incorrecta", f"Se detectó la fuente '{fuente}' en vez de Arial."))
+                errores.append((i+1, "Fuente incorrecta", f"Fuente '{fuente}' en vez de Arial."))
                 break
             if tamano and tamano != 12:
-                errores.append((i+1, "Tamaño incorrecto", f"Se detectó {tamano}pt en vez de 12pt."))
+                errores.append((i+1, "Tamaño incorrecto", f"{tamano}pt en vez de 12pt."))
                 break
 
-        # Limpieza
+        # Limpieza de caracteres
         for run in para.runs:
             if run.text:
                 encontrados = re.findall(REGEX_PERMITIDOS, run.text)
@@ -123,60 +126,51 @@ def validar_y_limpiar(doc: Document, filename: str):
                     char_counter.update(encontrados)
                     run.text = re.sub(REGEX_PERMITIDOS, "", run.text)
 
-    # Guardar en memoria
-    docx_bytes = BytesIO()
+    # Guardar doc limpio
+    docx_bytes = io.BytesIO()
     doc.save(docx_bytes)
     docx_bytes.seek(0)
 
-    # Crear reporte
-    txt_bytes = BytesIO()
-    resumen = {}
-
-    txt_bytes.write(f"📋 REPORTE DE ERRORES\nArchivo: {filename}\nGenerado: {datetime.now()}\n\n".encode("utf-8"))
+    # Crear reporte TXT
+    txt_bytes = io.BytesIO()
+    txt_bytes.write(f"📋 REPORTE: {filename}\nGenerado: {datetime.now()}\n\n".encode("utf-8"))
     for linea, tipo, desc in errores:
         txt_bytes.write(f"Línea {linea}: {tipo} → {desc}\n".encode("utf-8"))
-        resumen[tipo] = resumen.get(tipo, 0) + 1
 
-    if resumen:
-        txt_bytes.write("\n--- RESUMEN DE ERRORES ---\n".encode("utf-8"))
-        for tipo, count in resumen.items():
-            txt_bytes.write(f"{tipo}: {count} ocurrencias\n".encode("utf-8"))
-
-    txt_bytes.write("\n--- LIMPIEZA DE TEXTO ---\n".encode("utf-8"))
-    txt_bytes.write(f"Total de caracteres especiales eliminados: {especiales_count}\n".encode("utf-8"))
-    txt_bytes.write(f"Tipos únicos eliminados: {len(char_counter)}\n".encode("utf-8"))
-    if char_counter:
-        txt_bytes.write("\nDetalle por carácter:\n".encode("utf-8"))
-        for ch, cnt in char_counter.most_common():
-            txt_bytes.write(f"  {char_human(ch)} → {cnt}\n".encode("utf-8"))
-
+    txt_bytes.write(f"\nTotal de caracteres especiales eliminados: {especiales_count}\n".encode("utf-8"))
     txt_bytes.seek(0)
 
     return docx_bytes, txt_bytes
 
-
+# ==========================
+# Endpoint múltiple
+# ==========================
 @app.post("/procesar/")
-async def procesar(file: UploadFile = File(...)):
-    try:
-        doc = Document(file.file)
-    except Exception as e:
-        return {"error": f"No se pudo abrir el archivo: {e}"}
+async def procesar(files: List[UploadFile] = File(...)):
+    if not files:
+        raise HTTPException(status_code=400, detail="Debes subir al menos un archivo .docx")
 
-    docx_bytes, txt_bytes = validar_y_limpiar(doc, file.filename)
-
-    # Crear ZIP en memoria
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w") as zipf:
-        zipf.writestr(file.filename.replace(".docx", "_limpio.docx"), docx_bytes.read())
-        zipf.writestr(file.filename.replace(".docx", "_errores.txt"), txt_bytes.read())
+        for file in files:
+            if not file.filename.lower().endswith(".docx"):
+                continue
+            try:
+                doc = Document(file.file)
+            except Exception as e:
+                continue
+
+            docx_bytes, txt_bytes = validar_y_limpiar(doc, file.filename)
+
+            zipf.writestr(file.filename.replace(".docx", "_limpio.docx"), docx_bytes.read())
+            zipf.writestr(file.filename.replace(".docx", "_errores.txt"), txt_bytes.read())
+
     zip_buffer.seek(0)
 
-    # Crear token único
     token = str(uuid.uuid4())
     DOWNLOADS[token] = (zip_buffer.getvalue(), datetime.utcnow() + timedelta(minutes=EXP_MINUTES))
 
-    return JSONResponse({"token": token, "expires_in": EXP_MINUTES})
-
+    return JSONResponse({"token": token})
 
 @app.get("/download/{token}")
 def download_token(token: str):
@@ -188,5 +182,17 @@ def download_token(token: str):
     if exp <= datetime.utcnow():
         DOWNLOADS.pop(token, None)
         raise HTTPException(status_code=410, detail="Link expirado")
+
     headers = {"Content-Disposition": "attachment; filename=reportes_transcripciones.zip"}
     return StreamingResponse(io.BytesIO(data), media_type="application/zip", headers=headers)
+
+# ==========================
+# Health check
+# ==========================
+@app.get("/")
+async def root():
+    return {"message": "API de Validador de Transcripciones funcionando", "version": "2.0.0"}
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "message": "API funcionando correctamente"}
